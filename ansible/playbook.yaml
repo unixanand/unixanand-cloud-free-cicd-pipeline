@@ -1,0 +1,390 @@
+- name: Full DevOps Stack — Docker + Minikube + Jenkins + Webhook (WSL)
+  hosts: local
+  become: yes
+
+  vars:
+    wsl_user: "{{ ansible_user_id }}"
+    home_dir: "/home/{{ ansible_user_id }}/mini-kube-cicd"
+
+    jenkins_container: jenkins
+    jenkins_home: "{{ home_dir }}/jenkins_home"
+    kubeconfig_host: "{{ home_dir }}/.kube"
+    jenkins_image_dir: "{{ home_dir }}/jenkins-docker"
+
+    github_repo_owner: unixanand
+    github_repo_name: cloud-free-cicd-pipeline
+
+    docker_hub_user: "{{ lookup('env','DOCKERHUB_USER') | default('', true) }}"
+    docker_hub_password: "{{ lookup('env','DOCKERHUB_PASS') | default('', true) }}"
+    github_token: "{{ lookup('env','GITHUB_TOKEN') | default('', true) }}"
+
+    # IMPORTANT: container internal URL
+    jenkins_url: "http://localhost:8080"
+
+  tasks:
+  
+  # -------------------------------------------------
+  # Load Environment variables
+  # -------------------------------------------------
+
+  - name: Copy secrets into system environment
+    become: yes
+    blockinfile:
+      path: /etc/environment
+      block: "{{ lookup('file', '../secret') }}"
+      marker: "# {mark} ANSIBLE MANAGED SECRETS"
+      owner: root
+      group: root
+      mode: '0600'
+
+  - name: Read /etc/environment variables
+    become: yes
+    shell: |
+      set -a
+      source /etc/environment
+      env
+    args:
+      executable: /bin/bash
+    register: system_env
+    changed_when: false
+
+  - name: Set secrets as Ansible facts
+    set_fact:
+      dockerhub_user: "{{ system_env.stdout | regex_search('DOCKERHUB_USER=(.*)', '\\1') | first }}"
+      dockerhub_pass: "{{ system_env.stdout | regex_search('DOCKERHUB_PASS=(.*)', '\\1') | first }}"
+      github_token:  "{{ system_env.stdout | regex_search('GITHUB_TOKEN=(.*)', '\\1') | first }}"
+
+
+  - name: Load system environment
+    become: yes
+    shell: |
+      set -a
+      source /etc/environment
+      echo "$DOCKERHUB_USER|$DOCKERHUB_PASS|$GITHUB_TOKEN"
+    args:
+      executable: /bin/bash
+    register: env_vars
+    changed_when: false
+
+  - name: Set secrets as facts
+    set_fact:
+      dockerhub_user: "{{ env_vars.stdout.split('|')[0] }}"
+      dockerhub_pass: "{{ env_vars.stdout.split('|')[1] }}"
+      github_token:  "{{ env_vars.stdout.split('|')[2] }}"
+
+
+  # -------------------------------------------------
+  # Base packages
+  # -------------------------------------------------
+
+  - name: Install base packages
+    apt:
+      name:
+        - curl
+        - ca-certificates
+        - gnupg
+        - git
+        - unzip
+        - docker.io
+      state: present
+      update_cache: yes
+
+  - name: Start Docker
+    shell: service docker start || true
+    changed_when: false
+
+  - name: Add user to docker group
+    user:
+      name: "{{ wsl_user }}"
+      groups: docker
+      append: yes
+
+  # -------------------------------------------------
+  # Minikube kubectl wrapper
+  # -------------------------------------------------
+
+  - name: Create kubectl wrapper for minikube
+    copy:
+      dest: /usr/local/bin/kubectl
+      mode: "0755"
+      content: |
+        #!/bin/bash
+        minikube kubectl -- "$@"
+
+  - name: Ensure kube directory exists
+    file:
+      path: "{{ kubeconfig_host }}"
+      state: directory
+      owner: "{{ wsl_user }}"
+      group: "{{ wsl_user }}"
+
+  - name: Verify Minikube access
+    become: false
+    become_user: "{{ wsl_user }}"
+    shell: kubectl get nodes
+    register: kube_ready
+    retries: 10
+    delay: 5
+    until: kube_ready.rc == 0
+
+  # -------------------------------------------------
+  # Build Jenkins image
+  # -------------------------------------------------
+
+  - name: Ensure Jenkins build directory exists
+    file:
+      path: "{{ jenkins_image_dir }}"
+      state: directory
+
+  - name: Create Jenkins Dockerfile
+    copy:
+      dest: "{{ jenkins_image_dir }}/Dockerfile"
+      content: |
+        FROM jenkins/jenkins:lts
+        USER root
+        RUN apt-get update && apt-get install -y docker.io curl
+        RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
+         && install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl \
+         && rm kubectl
+        USER jenkins
+
+  - name: Build Jenkins image
+    community.docker.docker_image:
+      name: jenkins-docker
+      build:
+        path: "{{ jenkins_image_dir }}"
+      source: build
+
+  # -------------------------------------------------
+  # Kube config - set context
+  # -------------------------------------------------
+
+  - name: Fix kubeconfig server for container access
+    become: false
+    become_user: "{{ wsl_user }}"
+    shell: |
+      set -e
+      IP=$(minikube ip)
+      kubectl config set-cluster minikube --server=https://$IP:8443
+    args:
+      executable: /bin/bash
+    register: kubeconfig_fix
+    changed_when: "'set' in kubeconfig_fix.stdout or kubeconfig_fix.rc == 0"
+
+  # -------------------------------------------------
+  # Jenkins home
+  # -------------------------------------------------
+
+  - name: Create Jenkins home
+    file:
+      path: "{{ jenkins_home }}"
+      state: directory
+      owner: 1000
+      group: 1000
+
+  - name: Disable setup wizard
+    copy:
+      dest: "{{ jenkins_home }}/init.groovy.d/disableWizard.groovy"
+      owner: 1000
+      group: 1000
+      content: |
+        import jenkins.model.*
+        Jenkins.instance.setInstallState(
+          jenkins.install.InstallState.INITIAL_SETUP_COMPLETED
+        )
+  
+
+  - name: Create JCasC directory
+    file:
+      path: "{{ jenkins_home }}/jcasc"
+      state: directory
+      owner: 1000
+      group: 1000
+
+  - name: Copy Jenkins JCasC config
+    copy:
+      src: files/jenkins.yaml
+      dest: "{{ jenkins_home }}/jcasc/jenkins.yaml"
+      owner: 1000
+      group: 1000
+
+  # -------------------------------------------------
+  # Run Jenkins
+  # -------------------------------------------------
+
+  - name: Remove old container if exists
+    command: docker rm -f {{ jenkins_container }}
+    ignore_errors: yes
+
+  - name: Run Jenkins container
+    community.docker.docker_container:
+      name: "{{ jenkins_container }}"
+      image: jenkins-docker
+      state: started
+      restart_policy: unless-stopped
+      user: root
+      privileged: yes
+      network_mode: minikube
+      ports:
+        - "8081:8080"
+        - "50001:50000"
+      env:
+        JAVA_OPTS: -Djenkins.install.runSetupWizard=false
+        CASC_JENKINS_CONFIG: /var/jenkins_home/jcasc/jenkins.yaml
+        KUBECONFIG: /var/jenkins_home/.kube/config
+        JENKINS_URL: "{{ jenkins_url }}"
+        DOCKERHUB_USER: "{{ dockerhub_user }}"
+        DOCKERHUB_PASS: "{{ dockerhub_pass }}"
+        GITHUB_TOKEN: "{{ github_token }}"
+      volumes:
+        - "{{ jenkins_home }}:/var/jenkins_home"
+        - "/var/run/docker.sock:/var/run/docker.sock"
+        - "/home/aselvaga/.kube:/var/jenkins_home/.kube"
+        - "/home/aselvaga/.minikube:/home/aselvaga/.minikube"
+        - "{{ playbook_dir }}/files/job.groovy:/var/jenkins_home/job.groovy"
+
+  # -------------------------------------------------
+  # Wait Jenkins ready
+  # -------------------------------------------------
+
+  - name: Wait for Jenkins
+    uri:
+      url: http://localhost:8081/api/json
+      status_code: 200
+    register: result
+    retries: 60
+    delay: 10
+    until: result.status == 200
+
+  # -------------------------------------------------
+  # Install plugins
+  # -------------------------------------------------
+
+  - name: Copy plugins file into container
+    command: docker cp {{ playbook_dir }}/files/plugins.txt {{ jenkins_container }}:/tmp/plugins.txt
+
+  - name: Install Jenkins plugins
+    command: docker exec {{ jenkins_container }} jenkins-plugin-cli --plugin-file /tmp/plugins.txt
+
+  - name: Restart Jenkins after plugins
+    command: docker restart {{ jenkins_container }}
+
+  - name: Wait Jenkins after restart
+    uri:
+      url: http://localhost:8081/login
+      status_code: 200
+    register: result
+    retries: 60
+    delay: 10
+    until: result.status == 200
+
+  - name: Force reload JCasC
+    shell: |
+      docker exec {{ jenkins_container }} curl -X POST \
+        http://admin:admin123@localhost:8080/configuration-as-code/reload
+
+  # -------------------------------------------------
+  # COPY DSL INTO JENKINS (FIXED)
+  # -------------------------------------------------
+
+  - name: Copy pipeline DSL into Jenkins home
+    copy:
+      src: "{{ playbook_dir }}/files/job.groovy"
+      dest: "{{ jenkins_home }}/job.groovy"
+      owner: 1000
+      group: 1000
+      mode: '0644'
+
+  - name: Verify DSL exists
+    command: ls -l {{ jenkins_home }}/job.groovy
+
+  # -------------------------------------------------
+  # EXECUTE JOB DSL (FIXED)
+  # -------------------------------------------------
+
+  - name: Execute Job DSL via Jenkins CLI
+    shell: |
+      docker exec {{ jenkins_container }} bash -c '
+      curl -fsSL {{ jenkins_url }}/jnlpJars/jenkins-cli.jar -o /tmp/jenkins-cli.jar
+
+      cat <<EOF | java -jar /tmp/jenkins-cli.jar \
+        -s {{ jenkins_url }} \
+        -auth admin:admin123 \
+        groovy =
+      import jenkins.model.*
+      import javaposse.jobdsl.plugin.JenkinsJobManagement
+      import javaposse.jobdsl.dsl.DslScriptLoader
+
+      def jobManagement = new JenkinsJobManagement(System.out, [:], new File("/var/jenkins_home"))
+      new DslScriptLoader(jobManagement)
+        .runScript(new File("/var/jenkins_home/job.groovy").text)
+      EOF'
+
+  # -------------------------------------------------
+  # Start ngrok (WSL RELIABLE)
+  # -------------------------------------------------
+
+  - name: Install screen (required for persistent session)
+    apt:
+      name: screen
+      state: present
+      update_cache: yes
+
+  - name: Stop existing ngrok session if present
+    become: false
+    become_user: "{{ wsl_user }}"
+    shell: |
+      screen -S ngrok -X quit || true
+      pkill ngrok || true
+    changed_when: false
+
+  - name: Start ngrok in persistent screen session
+    become: false
+    become_user: "{{ wsl_user }}"
+    shell: |
+      screen -dmS ngrok ngrok http 8081
+    args:
+      executable: /bin/bash
+
+  - name: Wait for ngrok API
+    wait_for:
+      host: 127.0.0.1
+      port: 4040
+      delay: 2
+      timeout: 60
+
+  - name: Get ngrok tunnel info
+    uri:
+      url: http://127.0.0.1:4040/api/tunnels
+      return_content: yes
+    register: ngrok_api
+
+  - name: Extract ngrok public URL
+    set_fact:
+      jenkins_public_url: "{{ ngrok_api.json.tunnels[0].public_url }}"
+  
+
+  # -------------------------------------------------
+  # GitHub webhook
+  # -------------------------------------------------
+
+  - name: Create GitHub webhook
+    uri:
+      url: "https://api.github.com/repos/{{ github_repo_owner }}/{{ github_repo_name }}/hooks"
+      method: POST
+      headers:
+        Authorization: "token {{ github_token }}"
+        Accept: "application/vnd.github+json"
+      body_format: json
+      body:
+        name: web
+        active: true
+        events: [push]
+        config:
+          url: "{{ jenkins_public_url }}/github-webhook/"
+          content_type: json
+      status_code: [201, 422]
+    when:
+      - github_token != ""
+      - jenkins_public_url != ""
+  

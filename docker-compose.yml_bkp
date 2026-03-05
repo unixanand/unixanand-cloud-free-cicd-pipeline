@@ -1,0 +1,26 @@
+version: "3.9"
+
+services:
+  jenkins:
+    image: jenkins-k8s             #  custom Jenkins image with kubectl + docker CLI
+    container_name: jenkins
+    restart: unless-stopped
+    ports:
+      - "9090:8080"                # Jenkins UI
+      - "50000:50000"              # Jenkins agent port
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock   # Access host Docker
+      - ~/.kube:/var/jenkins_home/.kube             # Access Minikube
+      - ./Jenkins/plugins.txt:/usr/share/jenkins/ref/plugins.txt
+      - ./Jenkins/jenkins.yaml:/var/jenkins_home/casc_configs/jenkins.yaml
+      - ./Jenkins/job.groovy:/var/jenkins_home/job.groovy
+    environment:
+      CASC_JENKINS_CONFIG: /var/jenkins_home/casc_configs/jenkins.yaml
+      JAVA_OPTS: "-Djenkins.install.runSetupWizard=false"
+      # Add Docker registry credentials if needed
+      # DOCKER_USER: "username"
+      # DOCKER_PASS: "password"
+
+volumes:
+  jenkins_home:

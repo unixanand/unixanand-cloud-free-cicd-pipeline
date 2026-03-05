@@ -1,0 +1,72 @@
+pipeline {
+    agent any
+
+    environment {
+        IMAGE_NAME = "08474/kubernetes-app"
+        TAG = "${BUILD_NUMBER}"
+        DOCKER_CREDS = "docker-hub-creds"
+        KUBECONFIG = "/var/jenkins_home/.kube/config"
+    }
+
+    stages {
+
+        stage('Clone Repo') {
+            steps {
+                git branch: 'main', url: 'https://github.com/unixanand/cloud-free-cicd-pipeline.git'
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh 'docker build -t $IMAGE_NAME:$TAG .'
+            }
+        }
+
+        stage('Push to Docker Hub') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'docker-hub-creds',
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASS'
+                    )
+                ]) {
+                    sh '''
+                      echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                      docker push $IMAGE_NAME:$TAG
+                      docker logout
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                sh '''
+                  kubectl apply -f K8s/streamlit-deployment.yaml --validate=false
+                  kubectl set image deployment/streamlit-app streamlit=$IMAGE_NAME:$TAG
+                  kubectl rollout status deployment/streamlit-app
+                  kubectl apply -f K8s/streamlit-ingress.yaml
+                '''
+            }
+        }
+
+        stage('Port-Forward Streamlit') {
+            steps {
+                script {
+                    // Get the pod name dynamically
+                    def podName = sh(
+                        script: "kubectl get pods -l app=streamlit-app -o jsonpath='{.items[0].metadata.name}'",
+                        returnStdout: true
+                    ).trim()
+
+                    // Start port-forward in background
+                    sh "kubectl port-forward ${podName} 8501:8501 &"
+
+                    echo "Streamlit is now accessible at http://localhost:8501 on the Jenkins node"
+                }
+            }
+        }
+
+    }   // closes stages
+}       // closes pipeline

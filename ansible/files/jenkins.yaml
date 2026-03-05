@@ -1,0 +1,40 @@
+jenkins:
+  systemMessage: "Jenkins fully automated"
+  numExecutors: 2
+
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: admin
+          name: Administrator
+          password: admin123
+
+  authorizationStrategy:
+    loggedInUsersCanDoAnything:
+      allowAnonymousRead: true
+
+  remotingSecurity:
+    enabled: true
+
+  crumbIssuer: null
+
+unclassified:
+  gitHubPluginConfig:
+    hookUrl: "{{ ngrok_url }}/github-webhook/"
+  location:
+    url: "{{ ngrok_url }}/" 
+
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - usernamePassword:
+              scope: GLOBAL
+              id: docker-hub-creds
+              username: "${DOCKERHUB_USER}"
+              password: "${DOCKERHUB_PASS}"
+              description: Docker Hub login
+
+jobs:
+  - file: /var/jenkins_home/job.groovy
