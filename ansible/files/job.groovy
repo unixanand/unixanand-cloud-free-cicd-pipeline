@@ -11,7 +11,7 @@ pipelineJob('non-cloud-ci-cd') {
             scm {
                 git {
                     remote {
-                        url('https://github.com/unixanand/cloud-free-cicd-pipeline.git')
+                        url('https://github.com/unixanand/unixanand-cloud-free-cicd-pipeline.git')
                     }
                     branch('*/main')
                 }
