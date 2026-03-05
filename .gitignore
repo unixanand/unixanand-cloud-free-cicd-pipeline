@@ -1,4 +1,8 @@
 secret
 .kube
+.kube/*
 ansible/playbook.yaml.bkp
+kubectl
+.git
+.git/*
 
