@@ -12,7 +12,7 @@
     jenkins_image_dir: "{{ home_dir }}/jenkins-docker"
 
     github_repo_owner: unixanand
-    github_repo_name: cloud-free-cicd-pipeline
+    github_repo_name: unixanand-cloud-free-cicd-pipeline
 
     docker_hub_user: "{{ lookup('env','DOCKERHUB_USER') | default('', true) }}"
     docker_hub_password: "{{ lookup('env','DOCKERHUB_PASS') | default('', true) }}"
