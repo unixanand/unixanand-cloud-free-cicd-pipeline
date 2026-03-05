@@ -5,4 +5,5 @@ ansible/playbook.yaml.bkp
 kubectl
 .git
 .git/*
+Jenkins/Jenkinsfile-bkp
 
